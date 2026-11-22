@@ -1,0 +1,183 @@
+```yaml
+name: Hermes Agent Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for the AREWE marketing agent"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      WORKER_URL: https://hermes-arewe-api.smmb7880.workers.dev
+      TASK_INPUT: ${{ inputs.task }}
+      HERMES_HOME: ${{ runner.temp }}/hermes-home
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GEMINI_API_KEY" || exit 1
+          test -n "$ADMIN_TOKEN" || exit 1
+          test -n "$TASK_INPUT" || exit 1
+          if [ "${#TASK_INPUT}" -gt 5000 ]; then
+            echo "Task exceeds 5000 characters."
+            exit 1
+          fi
+          echo "Configuration validated."
+
+      - name: Install official Hermes Agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser --skip-computer-use
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v hermes
+          hermes --help >/dev/null
+
+      - name: Run agent with persistent context
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          node --input-type=module <<'NODE'
+          import { spawnSync } from "node:child_process";
+          import { randomUUID } from "node:crypto";
+
+          const base = process.env.WORKER_URL;
+          const token = process.env.ADMIN_TOKEN;
+          const task = process.env.TASK_INPUT;
+          const model = "gemini-3.5-flash-lite";
+
+          async function api(path, options = {}) {
+            const response = await fetch(`${base}${path}`, {
+              ...options,
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+                ...(options.headers || {})
+              },
+              signal: AbortSignal.timeout(20000)
+            });
+
+            const body = await response.json().catch(() => ({}));
+
+            if (!response.ok) {
+              throw new Error(`${path}: HTTP ${response.status}`);
+            }
+
+            return body;
+          }
+
+          let output = "";
+          let status = "FAILED";
+          let exitCode = 1;
+
+          try {
+            const [knowledge, skills, learning] = await Promise.all([
+              api("/v1/knowledge"),
+              api("/v1/skills"),
+              api("/v1/learning")
+            ]);
+
+            const context = {
+              product_knowledge: (knowledge.data || []).slice(0, 40),
+              skills: (skills.data || []).slice(0, 30),
+              previous_learning: (learning.data || []).slice(0, 30)
+            };
+
+            const prompt = [
+              "You are the Chief Marketing Agent for AREWE.",
+              "Use persistent context as the source of product facts.",
+              "Respect VERIFIED, PLANNED, PROPOSED and UNKNOWN statuses.",
+              "Never invent product features, metrics, users, testimonials, revenue or results.",
+              "Clearly distinguish facts, assumptions and recommendations.",
+              "Do not claim to have researched something unless a research tool was actually used.",
+              "Never publish, send messages, create accounts, spend money or make business commitments.",
+              "Never access or modify the AREWE application repository.",
+              "Use free methods only. Never use paid fallbacks.",
+              "Produce useful, structured and actionable work.",
+              "Include a final section named PERSISTENCE NOTES with reusable lessons.",
+              "",
+              "PERSISTENT CONTEXT:",
+              JSON.stringify(context),
+              "",
+              "TASK:",
+              task
+            ].join("\n");
+
+            const run = spawnSync("hermes", [
+              "chat",
+              "--provider", "gemini",
+              "--model", model,
+              "-q", prompt
+            ], {
+              encoding: "utf8",
+              timeout: 8 * 60 * 1000,
+              maxBuffer: 4 * 1024 * 1024,
+              env: process.env
+            });
+
+            output = [run.stdout || "", run.stderr || ""]
+              .filter(Boolean).join("\n").trim();
+
+            if (run.error) {
+              throw new Error(`Hermes process error: ${run.error.name}`);
+            }
+
+            exitCode = typeof run.status === "number" ? run.status : 1;
+            status = exitCode === 0 && (run.stdout || "").trim()
+              ? "COMPLETED"
+              : "FAILED";
+
+            if (!output) output = "Hermes returned no output.";
+          } catch (error) {
+            output = `${output}\nRunner error: ${error.message}`.trim();
+            status = "FAILED";
+            exitCode = 1;
+          }
+
+          const record = {
+            id: randomUUID(),
+            agent_role: "Chief Marketing Agent",
+            task_description: task.slice(0, 2000),
+            result: output.slice(0, 30000),
+            status,
+            model_provider: `Google Gemini (${model}; free-tier key)`
+          };
+
+          try {
+            await api("/v1/logs", {
+              method: "POST",
+              body: JSON.stringify(record)
+            });
+            console.log("PERSISTENCE: execution result saved to D1.");
+          } catch (error) {
+            console.error("Failed to save execution result:", error.message);
+            process.exit(1);
+          }
+
+          if (status !== "COMPLETED") {
+            console.error("Hermes agent execution failed.");
+            process.exit(exitCode || 1);
+          }
+
+          console.log("SUCCESS: Hermes Agent completed the task.");
+          console.log("\n--- AGENT OUTPUT ---\n");
+          console.log(output);
+          NODE
+```
